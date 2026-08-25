@@ -1,0 +1,9 @@
+[project]
+name = "jmapx-pdftext"
+version = "0.1.0"
+description = "Extract PDF text locally with pypdfium2 and PDFium"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "pypdfium2>=4,<6",
+]

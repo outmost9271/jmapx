@@ -1,0 +1,7 @@
+[project]
+name = "jmapx-railfare"
+version = "0.1.0"
+description = "Parse China Railway e-ticket reimbursement vouchers with format-change detection"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = []

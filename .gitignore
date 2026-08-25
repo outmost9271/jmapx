@@ -1,6 +1,14 @@
 # 身份凭据（含真实密码，禁止入库）
 jmapx_creds.json
 
-# Python 缓存
+# Python 缓存与项目独立虚拟环境
 __pycache__/
 *.pyc
+.venv/
+.ruff_cache/
+
+# 本地报销材料可能包含姓名、手机号、身份证号、税号等敏感信息，禁止入库
+邮件附件/
+????-??-?? *出差报销/
+pdf2png-output/
+pdftext-output/

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UV_BIN="/pi/uv/tool/bin/uv"
+PROJECT_DIR="$ROOT_DIR/tools/pdf2png"
+SCRIPT="$PROJECT_DIR/pdf_to_images.py"
+
+if [[ ! -x "$UV_BIN" ]]; then
+  printf '错误：找不到受控 uv：%s\n' "$UV_BIN" >&2
+  exit 1
+fi
+
+exec "$UV_BIN" run --project "$PROJECT_DIR" python "$SCRIPT" "$@"
