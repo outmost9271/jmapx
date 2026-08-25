@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""JMAP 客户端工具
+
+子命令:
+  total    获取邮件总数（含垃圾箱）
+  emails   列出所有邮件（含垃圾箱），JSON 返回
+
+凭据来源（优先级从高到低）：
+  1. 环境变量：JMAP_SERVER / JMAP_USERNAME / JMAP_PASSWORD（三者必须齐全）
+  2. 身份配置文件（JSON，权限必须为 600，否则拒绝执行）：
+     - 默认：本脚本同目录下的 jmapx_creds.json（非隐藏文件）
+     - 可用 --creds-file 参数指定其他位置
+     文件格式：{"server": "https://mail.example.com", "username": "user@example.com", "password": "..."}
+
+仅依赖 Python 3 标准库，无第三方包。
+"""
+
+import argparse
+import base64
+import fnmatch
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+DEFAULT_CREDS_FILE = "jmapx_creds.json"
+ENV_SERVER = "JMAP_SERVER"
+ENV_USERNAME = "JMAP_USERNAME"
+ENV_PASSWORD = "JMAP_PASSWORD"
+REQUIRED_FIELDS = ("server", "username", "password")
+USING = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"]
+HTTP_TIMEOUT = 30
+QUERY_PAGE_SIZE = 5000  # query 单页 id 数（服务器可能钳制，以响应为准）
+EMAIL_PROPERTIES = ["id", "subject", "from", "to", "receivedAt", "sentAt",
+                    "size", "preview", "mailboxIds", "keywords", "hasAttachment"]
+MAILBOX_PROPERTIES = ["id", "name", "role", "totalEmails", "unreadEmails"]
+
+
+def parse_datetime_arg(value, is_end, param_name):
+    """解析 --start/--end，返回 RFC 3339 UTC 字符串（秒级精度）
+
+    - 纯日期 YYYY-MM-DD：start 视为当日 00:00:00（含），end 视为次日 00:00:00（含当天全天）
+    - 带时间 YYYY-MM-DDTHH:MM:SS（可空格分隔），精确到秒；可带时区后缀 Z/±HH:MM
+    - 未带时区时按本地时区解释
+    """
+    text = value.strip().replace(" ", "T")
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            if is_end:
+                parsed += timedelta(days=1)  # 次日零点 = 含当天全天（before 不含语义）
+        else:
+            parsed = datetime.fromisoformat(text)
+    except ValueError:
+        die(f"参数 {param_name} 日期格式无效: {value}"
+            f"（支持 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM:SS，可带时区 Z/±HH:MM）")
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()  # 按本地时区解释
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_query_addr(text):
+    """解析 --from/--to 输入："Name <email>" / "email" / "Name"，返回匹配键"""
+    m = re.search(r"<([^<>]+)>", text)
+    if m:
+        return {"email": m.group(1).strip(), "name": (text[:m.start()].strip() or None)}
+    if "@" in text:
+        return {"email": text.strip(), "name": None}
+    return {"email": None, "name": text.strip() or None}
+
+
+def addr_matches(addr, query):
+    """单个地址是否精确匹配：邮箱不区分大小写全等，显示名精确相等"""
+    if query["email"] and addr.get("email"):
+        return addr["email"].lower() == query["email"].lower()
+    if query["name"] and addr.get("name"):
+        return addr["name"] == query["name"]
+    return False
+
+
+def emails_match(emails, field, query):
+    """邮件对象的 from/to 数组中是否有任一地址精确匹配"""
+    return any(addr_matches(a, query) for a in emails.get(field) or [])
+
+
+def die(message):
+    """输出告警到 stderr 并以非零码退出（拒绝执行）"""
+    print(f"警告: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_creds_from_env():
+    """读取环境变量凭据，三者齐全才返回"""
+    server = os.environ.get(ENV_SERVER)
+    username = os.environ.get(ENV_USERNAME)
+    password = os.environ.get(ENV_PASSWORD)
+    if server and username and password:
+        return {"server": server, "username": username, "password": password}, "环境变量 JMAP_SERVER/JMAP_USERNAME/JMAP_PASSWORD"
+    return None, None
+
+
+def get_creds_from_file(path):
+    """读取身份配置文件：校验存在性、JSON 合法性、字段完整性、权限必须为 600"""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        die(f"身份配置文件不存在: {path}")
+    if os.name != "nt":  # Windows 无 POSIX 权限语义，跳过权限检查
+        mode = stat.S_IMODE(st.st_mode)
+        if mode != 0o600:
+            die(f"身份配置文件权限必须为 600，当前为 {oct(mode)}，已拒绝执行: {path}"
+                f"（请先执行: chmod 600 {path}）")
+    try:
+        with open(path, encoding="utf-8") as f:
+            creds = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"身份配置文件不是合法 JSON: {path}（{e}）")
+    except OSError as e:
+        die(f"无法读取身份配置文件: {path}（{e}）")
+    if not isinstance(creds, dict):
+        die(f"身份配置文件格式错误，应为 JSON 对象: {path}")
+    missing = [k for k in REQUIRED_FIELDS if not creds.get(k)]
+    if missing:
+        die(f"身份配置文件缺少必填字段: {', '.join(missing)}（文件: {path}）")
+    return creds, f"身份配置文件 {path}"
+
+
+def normalize_server(server):
+    """补全协议前缀并去掉末尾斜杠"""
+    if not server.startswith(("http://", "https://")):
+        server = "https://" + server
+    return server.rstrip("/")
+
+
+def basic_auth_header(username, password):
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def http_json(url, username, password, payload=None):
+    """发送 HTTP 请求并解析 JSON 响应；认证失败/网络错误/限流时给出告警并退出"""
+    headers = {
+        "Authorization": basic_auth_header(username, password),
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if payload is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("认证失败（HTTP 401），请检查用户名/密码")
+        if e.code == 429:
+            die("请求被限流（HTTP 429），请稍后重试")
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except OSError:
+            detail = ""
+        die(f"HTTP {e.code}: {detail or e.reason}")
+    except urllib.error.URLError as e:
+        die(f"网络错误: {e.reason}")
+    except json.JSONDecodeError as e:
+        die(f"服务器响应不是合法 JSON: {e}")
+
+
+def resolve_creds(creds_file):
+    """凭据解析：环境变量优先，其次身份配置文件（返回 (凭据, 来源描述)）"""
+    creds, source = get_creds_from_env()
+    if creds is None:
+        env_set = [k for k in (ENV_SERVER, ENV_USERNAME, ENV_PASSWORD) if os.environ.get(k)]
+        if env_set:
+            print(f"提示: 环境变量 {', '.join(env_set)} 已设置但不完整，回退读取身份配置文件",
+                  file=sys.stderr)
+        path = creds_file or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), DEFAULT_CREDS_FILE)
+        creds, source = get_creds_from_file(path)
+    return creds, source
+
+
+def get_session_and_account(creds, debug=False):
+    """自动发现 + 认证获取 Session，并确定账户（返回 (session, aid)）"""
+    server = normalize_server(creds["server"])
+    username = creds["username"]
+    password = creds["password"]
+    session = http_json(f"{server}/.well-known/jmap", username, password)
+    if debug:
+        print(f"[调试] 服务器: {server}", file=sys.stderr)
+        print(f"[调试] Session: {session.get('apiUrl')}", file=sys.stderr)
+
+    accounts = session.get("accounts") or {}
+    if not accounts:
+        die("Session 未返回任何可用账户")
+    aid = (session.get("primaryAccounts") or {}).get("urn:ietf:params:jmap:mail")
+    if not aid or aid not in accounts:
+        aid = next(iter(accounts))
+    if debug:
+        acc = accounts.get(aid, {})
+        print(f"[调试] 账户: {acc.get('name')} (id={aid})", file=sys.stderr)
+    return session, aid
+
+
+def jmap_post(api_url, username, password, method_calls, using=USING):
+    """发送一次 JMAP API 请求，返回 methodResponses 列表"""
+    result = http_json(api_url, username, password, {
+        "using": using,
+        "methodCalls": method_calls,
+    })
+    return result.get("methodResponses", [])
+
+
+def query_all_email_ids(api_url, username, password, aid, query_filter=None):
+    """Email/query 分页取全部邮件 id（含垃圾箱），返回 (ids, total)
+
+    query_filter: 服务端过滤条件（仅支持日期等精确语义的字段）
+    """
+    ids = []
+    total = None
+    position = 0
+    page = QUERY_PAGE_SIZE
+    while True:
+        args = {
+            "accountId": aid,
+            "sort": [{"property": "receivedAt", "isAscending": False}],
+            "position": position,
+            "limit": page,
+            "calculateTotal": total is None,  # 仅第一页要 total
+        }
+        if query_filter:
+            args["filter"] = query_filter
+        responses = jmap_post(api_url, username, password, [[
+            "Email/query", args, "q",
+        ]])
+        args = next((a for n, a, _ in responses if n == "Email/query"), None)
+        if args is None:
+            die(f"Email/query 失败: {json.dumps(responses, ensure_ascii=False)[:300]}")
+        page_ids = args.get("ids") or []
+        if total is None:
+            total = args.get("total")
+        ids.extend(page_ids)
+        # 服务器钳制 limit 时以响应为准
+        limit_used = args.get("limit", page)
+        if len(page_ids) < limit_used:
+            break  # 本页未取满，说明已到末尾
+        position += len(page_ids)
+        if total is not None and len(ids) >= total:
+            break
+        if not page_ids:
+            break  # 防死循环
+    return ids, total
+
+
+def fetch_emails_batched(api_url, username, password, aid, ids,
+                         max_objects, max_calls, debug=False,
+                         properties=None, body_options=None):
+    """单请求多调用批量拉取邮件（每请求 ≤max_calls 批，每批 ≤max_objects）
+
+    properties: 属性白名单（默认 EMAIL_PROPERTIES）
+    body_options: 附加到每个 Email/get 的正文参数（fetch*BodyValues/maxBodyValueBytes）
+    requestTooLarge 时自动将该批减半重试。返回 (emails, not_found)。
+    """
+    properties = properties or EMAIL_PROPERTIES
+    body_options = body_options or {}
+    batches = [ids[i:i + max_objects] for i in range(0, len(ids), max_objects)]
+    emails = []
+    not_found = []
+    pending = batches
+    requests = 0
+    while pending:
+        chunk = pending[:max_calls]
+        requests += 1
+        calls = []
+        for i, batch in enumerate(chunk):
+            call_args = {
+                "accountId": aid, "ids": batch, "properties": properties,
+            }
+            call_args.update(body_options)
+            calls.append(["Email/get", call_args, f"g{i}"])
+        responses = jmap_post(api_url, username, password, calls)
+        next_pending = []
+        for i, (name, args_, cid) in enumerate(responses):
+            if name == "Email/get":
+                emails.extend(args_.get("list", []))
+                not_found.extend(args_.get("notFound", []))
+            elif name == "error" and args_.get("type") == "requestTooLarge":
+                batch = chunk[i]
+                if len(batch) <= 1:
+                    die("单个 id 的 Email/get 仍被拒绝（requestTooLarge），服务器限制异常")
+                half = len(batch) // 2
+                next_pending.extend([batch[:half], batch[half:]])
+            else:
+                die(f"Email/get 失败: {json.dumps((name, args_), ensure_ascii=False)[:300]}")
+        # 剩余批次 + 降级重试批次，继续下一轮 HTTP 请求
+        pending = pending[max_calls:] + next_pending
+    if debug:
+        print(f"[调试] Email/get: {len(batches)} 批, {requests} 个 HTTP 请求", file=sys.stderr)
+    return emails, not_found
+
+
+def http_open(url, username, password, extra_headers=None):
+    """打开 HTTP 响应（流式），返回响应对象；错误时告警退出"""
+    headers = {
+        "Authorization": basic_auth_header(username, password),
+        "Accept": "application/octet-stream",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("认证失败（HTTP 401），请检查用户名/密码")
+        die(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200] or e.reason}")
+    except urllib.error.URLError as e:
+        die(f"网络错误: {e.reason}")
+
+
+def fetch_range_to_file(url, username, password, start, end, part_path):
+    """Range 分块下载一段并写入 part 文件（流式，不占内存）"""
+    with http_open(url, username, password, {"Range": f"bytes={start}-{end}"}) as resp, \
+            open(part_path, "wb") as f:
+        shutil.copyfileobj(resp, f, 64 * 1024)
+
+
+def merge_parts(part_paths, out_path):
+    """按序合并分块文件并清理 part 文件"""
+    with open(out_path, "wb") as f:
+        for p in part_paths:
+            with open(p, "rb") as pf:
+                shutil.copyfileobj(pf, f, 64 * 1024)
+            os.unlink(p)
+
+
+def unique_dest_path(dest_dir, name, blob_id):
+    """重名保护：已存在则追加 -{n}-{blobId} 后缀，绝不覆盖
+
+    超长兜底：候选名超过文件系统 NAME_MAX（默认 255 字节）时，
+    先截断 blobId，仍超限再截断原名，保证文件名合法。
+    """
+    path = os.path.join(dest_dir, name)
+    if not os.path.exists(path):
+        return path, False
+    try:
+        name_max = os.pathconf(dest_dir, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        name_max = 255
+    stem, ext = os.path.splitext(name)
+    n = 1
+    while True:
+        blob_part = blob_id
+        while True:
+            cand = f"{stem}-{n}-{blob_part}{ext}"
+            if len(cand.encode("utf-8")) <= name_max:
+                break
+            if blob_part:
+                blob_part = blob_part[:-1]  # 超限先截断 blobId（ASCII，安全）
+            elif len(stem) > 0:
+                stem = stem[:-1]            # 极端兜底：截断原名
+            else:
+                cand = f"-{n}{ext}"        # 最终兜底
+                break
+        cand_path = os.path.join(dest_dir, cand)
+        if not os.path.exists(cand_path):
+            return cand_path, True
+        n += 1
+
+
+def download_one_blob(download_url, account_id, username, password,
+                      blob_id, name, dest_dir, chunks, debug=False):
+    """下载单个 blob：探测 Range 支持 → 分块并发或单连接 → 重名保护后落盘
+
+    返回 dict: {blobId, file, size, renamed}
+    """
+    name = os.path.basename(name or blob_id) or blob_id
+    url = download_url.format(accountId=account_id, blobId=blob_id,
+                              name=urllib.parse.quote(name), type="")
+
+    tmp_path = os.path.join(dest_dir, f".{name}.{blob_id[:8]}.tmp")
+    # 探测: Range 0-0，确认服务器支持分块并获取总大小
+    probe = http_open(url, username, password, {"Range": "bytes=0-0"})
+    with probe:
+        status = probe.status
+        cr = probe.headers.get("Content-Range") or ""
+        total = None
+        if status == 206:
+            m = re.search(r"bytes 0-0/(\d+)", cr)
+            if m:
+                total = int(m.group(1))
+        elif status == 200 and probe.headers.get("Content-Length"):
+            # 服务器忽略 Range：探测已返回全量，直接落盘
+            total = int(probe.headers["Content-Length"])
+            with open(tmp_path, "wb") as f:
+                shutil.copyfileobj(probe, f, 64 * 1024)
+
+    try:
+        if not os.path.exists(tmp_path):
+            if total is None:
+                # 探测无 Content-Range：单连接全量下载
+                if debug:
+                    print(f"[调试] {blob_id[:8]}… 服务器不支持 Range，单连接下载", file=sys.stderr)
+                with http_open(url, username, password) as resp, open(tmp_path, "wb") as f:
+                    shutil.copyfileobj(resp, f, 64 * 1024)
+                    total = int(resp.headers.get("Content-Length") or 0)
+            elif chunks > 1 and total > 0:
+                # Range 分块并发下载
+                step = (total + chunks - 1) // chunks
+                ranges = [(s, min(s + step - 1, total - 1)) for s in range(0, total, step)]
+                part_paths = [os.path.join(dest_dir, f".{name}.{blob_id[:8]}.part{i}")
+                              for i in range(len(ranges))]
+                if debug:
+                    print(f"[调试] {blob_id[:8]}… {total} 字节, {len(ranges)} 段并发 Range 下载", file=sys.stderr)
+                try:
+                    with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+                        futures = [pool.submit(fetch_range_to_file, url, username, password,
+                                               s, e, p) for (s, e), p in zip(ranges, part_paths)]
+                        for f in futures:
+                            f.result()  # 任一段失败即抛异常
+                    merge_parts(part_paths, tmp_path)
+                except BaseException:
+                    for p in part_paths:
+                        if os.path.exists(p):
+                            os.unlink(p)
+                    raise
+            else:
+                # 单块（chunks<=1 或小文件）：单连接全量下载
+                with http_open(url, username, password) as resp, open(tmp_path, "wb") as f:
+                    shutil.copyfileobj(resp, f, 64 * 1024)
+
+        final_path, renamed = unique_dest_path(dest_dir, name, blob_id)
+        os.replace(tmp_path, final_path)
+        return {"blobId": blob_id, "file": final_path,
+                "size": os.path.getsize(final_path), "renamed": renamed}
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def attachment_matches(name, pattern):
+    """附件名 glob 匹配（不区分大小写），如 *.pdf / 发票*"""
+    return fnmatch.fnmatch(name.lower(), pattern.lower())
+
+
+def cmd_attachments(args):
+    """子命令 attachments：按 ids 查邮件附件列表，按过滤语法分组（matched/unmatched）返回"""
+    creds, source = resolve_creds(args.creds_file)
+    if args.debug:
+        print(f"[凭据来源] {source}", file=sys.stderr)
+    session, aid = get_session_and_account(creds, args.debug)
+    api_url = session["apiUrl"]
+    username, password = creds["username"], creds["password"]
+
+    core = (session.get("capabilities") or {}).get("urn:ietf:params:jmap:core", {})
+    max_objects = core.get("maxObjectsInGet") or 500
+    max_calls = core.get("maxCallsInRequest") or 16
+
+    ids = [i.strip() for i in (args.ids or "").split(",") if i.strip()]
+    if not ids:
+        die("--ids 不能为空，请提供逗号分隔的邮件 id 列表")
+    seen = set()
+    uniq = [i for i in ids if not (i in seen or seen.add(i))]
+
+    # 过滤语法：可选 ! 前缀反向；匹配引擎为 glob（不区分大小写）
+    invert = False
+    pattern = args.filter
+    if pattern is not None:
+        if pattern.startswith("!"):
+            invert = True
+            pattern = pattern[1:]
+        if not pattern:
+            die("--filter 为空（! 前缀后需跟匹配模式）")
+
+    props = ["id", "subject", "from", "to", "attachments"]
+    emails, not_found = fetch_emails_batched(
+        api_url, username, password, aid, uniq, max_objects, max_calls,
+        args.debug, properties=props)
+
+    order = {eid: i for i, eid in enumerate(uniq)}
+    emails.sort(key=lambda e: order.get(e.get("id"), 10 ** 9))
+
+    result_emails = []
+    for e in emails:
+        matched, unmatched = [], []
+        for a in e.get("attachments") or []:
+            name = a.get("name") or ""
+            hit = attachment_matches(name, pattern) != invert if pattern is not None else True
+            item = {"partId": a.get("partId"), "name": a.get("name"),
+                    "type": a.get("type"), "size": a.get("size"),
+                    "blobId": a.get("blobId")}
+            (matched if hit else unmatched).append(item)
+        result_emails.append({"id": e["id"], "subject": e.get("subject"),
+                              "from": e.get("from"), "to": e.get("to"),
+                              "matched": matched, "unmatched": unmatched})
+
+    output = {"accountId": aid, "requested": len(uniq),
+              "notFound": not_found, "emails": result_emails}
+    if args.filter is not None:
+        output["filter"] = args.filter
+
+    # ---- 可选：下载所有命中的附件（matched 组）到指定目录 ----
+    if args.download_dir:
+        dest_dir = os.path.abspath(args.download_dir)
+        if not os.path.isdir(dest_dir):
+            die(f"目标目录不存在: {args.download_dir}（不会自动创建）")
+        download_url = session.get("downloadUrl")
+        if not download_url:
+            die("Session 未提供 downloadUrl")
+        jobs = []
+        seen = set()
+        for e in result_emails:
+            for a in e["matched"]:
+                bid = a.get("blobId")
+                if bid and bid not in seen:
+                    seen.add(bid)
+                    jobs.append((bid, a.get("name") or None))
+        if args.debug:
+            print(f"[调试] 下载 {len(jobs)} 个命中附件到 {dest_dir} | "
+                  f"并发: {args.concurrency} | 分块: {args.chunks}", file=sys.stderr)
+        downloaded, failed = [], []
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            futures = {pool.submit(download_one_blob, download_url, aid, username, password,
+                                   bid, name, dest_dir, args.chunks, args.debug): bid
+                       for bid, name in jobs}
+            for fut in futures:
+                bid = futures[fut]
+                try:
+                    downloaded.append(fut.result())
+                except BaseException as e:
+                    failed.append({"blobId": bid, "error": str(e)})
+        output["download"] = {"dir": dest_dir, "requested": len(jobs),
+                               "downloaded": downloaded, "failed": failed}
+
+    print(json.dumps(output, ensure_ascii=False, indent=4 if args.pretty else None))
+    if args.download_dir and output["download"]["failed"]:
+        print(f"警告: {len(output['download']['failed'])} 个附件下载失败", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_download(args):
+    """子命令 download：按 blobId 下载附件到指定目录（多文件并发 + Range 分块）"""
+    creds, source = resolve_creds(args.creds_file)
+    if args.debug:
+        print(f"[凭据来源] {source}", file=sys.stderr)
+    session, aid = get_session_and_account(creds, args.debug)
+    username, password = creds["username"], creds["password"]
+
+    dest_dir = os.path.abspath(args.dir)
+    if not os.path.isdir(dest_dir):
+        die(f"目标目录不存在: {args.dir}（不会自动创建）")
+    blob_ids = [b.strip() for b in (args.blob_ids or "").split(",") if b.strip()]
+    if not blob_ids:
+        die("--blob-ids 不能为空")
+    names = None
+    if args.names:
+        names = [n.strip() for n in args.names.split(",") if n.strip()]
+        if len(names) != len(blob_ids):
+            die(f"--names 数量({len(names)})与 --blob-ids 数量({len(blob_ids)})不一致")
+    download_url = session.get("downloadUrl")
+    if not download_url:
+        die("Session 未提供 downloadUrl")
+
+    if args.debug:
+        print(f"[调试] 目标目录: {dest_dir} | 并发文件数: {args.concurrency} | 每文件分块: {args.chunks}",
+              file=sys.stderr)
+    downloaded, failed = [], []
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        futures = {pool.submit(download_one_blob, download_url, aid, username, password,
+                               bid, names[i] if names else None, dest_dir,
+                               args.chunks, args.debug): bid
+                   for i, bid in enumerate(blob_ids)}
+        for fut in futures:
+            bid = futures[fut]
+            try:
+                downloaded.append(fut.result())
+            except BaseException as e:
+                failed.append({"blobId": bid, "error": str(e)})
+
+    output = {"dir": dest_dir, "requested": len(blob_ids),
+              "downloaded": downloaded, "failed": failed}
+    print(json.dumps(output, ensure_ascii=False, indent=4 if args.pretty else None))
+    if failed:
+        print(f"警告: {len(failed)} 个附件下载失败", file=sys.stderr)
+        sys.exit(1)
+
+
+def fetch_mailboxes(api_url, username, password, aid, max_objects):
+    """获取全部邮箱信息（含垃圾箱）；超 maxObjectsInGet 时经 Mailbox/query 分批兜底"""
+    """获取全部邮箱信息（含垃圾箱）；超 maxObjectsInGet 时经 Mailbox/query 分批兜底"""
+    responses = jmap_post(api_url, username, password, [[
+        "Mailbox/get", {"accountId": aid, "ids": None, "properties": MAILBOX_PROPERTIES}, "m",
+    ]])
+    name, args_ = responses[0][0], responses[0][1]
+    if name == "Mailbox/get":
+        return args_.get("list", [])
+    if name == "error" and args_.get("type") == "requestTooLarge":
+        # 邮箱过多：Mailbox/query 拿 id 再分批 get
+        responses = jmap_post(api_url, username, password, [[
+            "Mailbox/query", {"accountId": aid, "limit": None}, "mq",
+        ]])
+        qargs = next((a for n, a, _ in responses if n == "Mailbox/query"), None)
+        if qargs is None:
+            die("Mailbox/query 失败")
+        ids = qargs.get("ids") or []
+        result = []
+        for i in range(0, len(ids), max_objects):
+            responses = jmap_post(api_url, username, password, [[
+                "Mailbox/get", {"accountId": aid, "ids": ids[i:i + max_objects],
+                                "properties": MAILBOX_PROPERTIES}, "m",
+            ]])
+            margs = next((a for n, a, _ in responses if n == "Mailbox/get"), None)
+            if margs is None:
+                die("Mailbox/get 分批拉取失败")
+            result.extend(margs.get("list", []))
+        return result
+    die(f"Mailbox/get 失败: {json.dumps(responses, ensure_ascii=False)[:300]}")
+
+
+def cmd_total(args):
+    """子命令 total：获取邮件总数（含垃圾箱）"""
+    creds, source = resolve_creds(args.creds_file)
+    if args.debug:
+        print(f"[凭据来源] {source}", file=sys.stderr)
+    session, aid = get_session_and_account(creds, args.debug)
+    api_url = session["apiUrl"]
+    username, password = creds["username"], creds["password"]
+
+    # limit=1：只需要 total，不取数据（limit=0 时部分服务器会返回全部 id，浪费传输）
+    responses = jmap_post(api_url, username, password, [[
+        "Email/query", {"accountId": aid, "limit": 1, "calculateTotal": True}, "q1",
+    ]])
+    args_ = next((a for n, a, _ in responses if n == "Email/query"), None)
+    if args_ is None:
+        die(f"响应中未找到 Email/query 结果: {json.dumps(responses, ensure_ascii=False)[:300]}")
+    total = args_.get("total")
+
+    print(json.dumps({"total": total}, ensure_ascii=False, indent=4 if args.pretty else None))
+
+
+def cmd_emails(args):
+    """子命令 emails：列出所有邮件（含垃圾箱），支持日期/发件人/收件人过滤，JSON 返回"""
+    creds, source = resolve_creds(args.creds_file)
+    if args.debug:
+        print(f"[凭据来源] {source}", file=sys.stderr)
+    session, aid = get_session_and_account(creds, args.debug)
+    api_url = session["apiUrl"]
+    username, password = creds["username"], creds["password"]
+
+    # 从 Session 能力声明动态读取上限（不硬编码）
+    core = (session.get("capabilities") or {}).get("urn:ietf:params:jmap:core", {})
+    max_objects = core.get("maxObjectsInGet") or 500
+    max_calls = core.get("maxCallsInRequest") or 16
+
+    # ---- 过滤条件解析 ----
+    # 日期：服务端过滤（before/after，精确到秒，RFC 3339）
+    server_filter = {}
+    if args.start:
+        server_filter["after"] = parse_datetime_arg(args.start, False, "--start")
+    if args.end:
+        server_filter["before"] = parse_datetime_arg(args.end, True, "--end")
+    # 发件人/收件人：客户端精确匹配（JMAP from/to 为包含式搜索，非精确）
+    q_from = parse_query_addr(args.from_) if args.from_ else None
+    q_to = parse_query_addr(args.to) if args.to else None
+    if args.debug and server_filter:
+        print(f"[调试] 服务端日期过滤: {json.dumps(server_filter, ensure_ascii=False)}", file=sys.stderr)
+
+    # 1. 全部邮件 id（含垃圾箱），按需服务端日期过滤
+    ids, total = query_all_email_ids(api_url, username, password, aid,
+                                     server_filter or None)
+    if args.debug:
+        print(f"[调试] Email/query: 共 {len(ids)} 个 id, total={total}", file=sys.stderr)
+
+    # 2. 单请求多调用批量拉取元数据
+    emails, not_found = fetch_emails_batched(
+        api_url, username, password, aid, ids, max_objects, max_calls, args.debug)
+
+    # 3. 客户端精确过滤（发件人/收件人）
+    if q_from:
+        emails = [e for e in emails if emails_match(e, "from", q_from)]
+    if q_to:
+        emails = [e for e in emails if emails_match(e, "to", q_to)]
+    if args.debug and (q_from or q_to):
+        print(f"[调试] 客户端精确过滤后: {len(emails)} 封", file=sys.stderr)
+
+    # 4. 本地排序：RFC 允许 /get 乱序返回，统一按 receivedAt 倒序、id 兜底
+    emails.sort(key=lambda e: (e.get("receivedAt") or "", e.get("id") or ""), reverse=True)
+
+    # 5. 邮箱清单（含垃圾箱）
+    mailboxes = fetch_mailboxes(api_url, username, password, aid, max_objects)
+
+    output = {
+        "accountId": aid,
+        "total": total,
+        "returned": len(emails),
+        "notFound": not_found,
+        "mailboxes": mailboxes,
+        "emails": emails,
+    }
+    applied = {}
+    if args.from_:
+        applied["from"] = args.from_
+    if args.to:
+        applied["to"] = args.to
+    if args.start:
+        applied["start"] = args.start
+    if args.end:
+        applied["end"] = args.end
+    if applied:
+        output["filter"] = applied  # 回显用户输入的过滤条件
+    print(json.dumps(output, ensure_ascii=False, indent=4 if args.pretty else None))
+
+
+def cmd_detail(args):
+    """子命令 detail：按 ids 列表查询邮件详细信息（含正文、附件列表），JSON 返回
+
+    批量策略：≤maxObjectsInGet 单调用；≤maxCallsInRequest×maxObjectsInGet 单请求多调用；
+    更多则串行多个 HTTP 请求（无并发）。
+    """
+    creds, source = resolve_creds(args.creds_file)
+    if args.debug:
+        print(f"[凭据来源] {source}", file=sys.stderr)
+    session, aid = get_session_and_account(creds, args.debug)
+    api_url = session["apiUrl"]
+    username, password = creds["username"], creds["password"]
+
+    # 从 Session 能力声明动态读取上限（不硬编码）
+    core = (session.get("capabilities") or {}).get("urn:ietf:params:jmap:core", {})
+    max_objects = core.get("maxObjectsInGet") or 500
+    max_calls = core.get("maxCallsInRequest") or 16
+
+    # 解析并去重 ids（保持首次出现顺序）
+    ids = [i.strip() for i in (args.ids or "").split(",") if i.strip()]
+    if not ids:
+        die("--ids 不能为空，请提供逗号分隔的邮件 id 列表")
+    seen = set()
+    uniq = [i for i in ids if not (i in seen or seen.add(i))]
+    if len(uniq) != len(ids) and args.debug:
+        print(f"[调试] 输入 {len(ids)} 个 id，去重后 {len(uniq)} 个", file=sys.stderr)
+
+    # 元数据 + 正文 + 附件列表
+    props = EMAIL_PROPERTIES + ["textBody", "htmlBody", "bodyValues", "attachments"]
+    body_options = {"fetchTextBodyValues": True, "fetchHTMLBodyValues": True}
+    if args.body_max_bytes is not None:
+        body_options["maxBodyValueBytes"] = args.body_max_bytes
+
+    emails, not_found = fetch_emails_batched(
+        api_url, username, password, aid, uniq, max_objects, max_calls,
+        args.debug, properties=props, body_options=body_options)
+
+    # 按输入 ids 顺序重排（RFC 允许 /get 乱序返回）
+    order = {eid: i for i, eid in enumerate(uniq)}
+    emails.sort(key=lambda e: order.get(e.get("id"), 10 ** 9))
+
+    output = {
+        "accountId": aid,
+        "requested": len(uniq),
+        "returned": len(emails),
+        "notFound": not_found,
+        "emails": emails,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=4 if args.pretty else None))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="jmapx", description="JMAP 客户端工具")
+    parser.add_argument("--creds-file", metavar="PATH",
+                        help=f"身份配置文件路径（默认: 脚本同目录下的 {DEFAULT_CREDS_FILE}）")
+    parser.add_argument("--debug", action="store_true",
+                        help="开启调试模式，输出凭据来源等诊断信息（默认关闭）")
+    parser.add_argument("--pretty", action="store_true",
+                        help="格式化输出 JSON（4 个空格缩进），默认紧凑格式")
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+    p_total = subparsers.add_parser("total", help="获取邮件总数（含垃圾箱）")
+    p_total.set_defaults(func=cmd_total)
+    p_emails = subparsers.add_parser(
+        "emails",
+        help="列出所有邮件（含垃圾箱），JSON 返回；支持日期/发件人/收件人过滤",
+        description=("列出所有邮件（含垃圾箱），JSON 返回。"
+                     "日期过滤在服务端执行（精确到秒）；发件人/收件人为客户端精确匹配"
+                     "（JMAP 协议的 from/to 为包含式搜索，无法保证精确）。"
+                     "结束时间不含边界时刻（before 语义）；--end 仅给日期时视为含当天全天。"))
+    p_emails.add_argument("--from", dest="from_", metavar="TEXT",
+                          help="发件人精确匹配：邮箱地址（不区分大小写）或显示名；"
+                               "支持 \"Name <email>\" 格式")
+    p_emails.add_argument("--to", metavar="TEXT",
+                          help="收件人精确匹配，规则同 --from")
+    p_emails.add_argument("--start", metavar="DT",
+                          help="开始时间（含）。YYYY-MM-DD（当日 00:00:00）或 "
+                               "YYYY-MM-DDTHH:MM:SS（精确到秒），可带时区 Z/±HH:MM，缺省按本地时区")
+    p_emails.add_argument("--end", metavar="DT",
+                          help="结束时间（不含）。YYYY-MM-DD（视为次日 00:00:00，即含当天全天）或 "
+                               "YYYY-MM-DDTHH:MM:SS（精确到秒）")
+    p_emails.set_defaults(func=cmd_emails)
+    p_detail = subparsers.add_parser(
+        "detail",
+        help="按 ids 查询邮件详细信息（含正文、附件列表），JSON 返回",
+        description=("按 ids 列表查询邮件详细信息（主题/发件人/时间/正文/附件列表），JSON 返回。"
+                     "批量策略：≤maxObjectsInGet 单调用；≤maxCallsInRequest×maxObjectsInGet "
+                     "单请求多调用；更多则串行多个 HTTP 请求（无并发）。"))
+    p_detail.add_argument("--ids", metavar="LIST", required=True,
+                          help="逗号分隔的邮件 id 列表，如 \"id1,id2,id3\"")
+    p_detail.add_argument("--body-max-bytes", type=int, metavar="N", default=10000,
+                          help="正文内容截断字节数，0 表示不截断（默认 10000）")
+    p_detail.set_defaults(func=cmd_detail)
+    p_dl = subparsers.add_parser(
+        "download",
+        help="按 blobId 下载附件到指定目录（多文件并发 + Range 分块）",
+        description=("按 blobId 下载附件到指定目录。--dir 必须已存在（不会自动创建）。"
+                     "文件重名时自动重命名（原名-N-blobId前8位），绝不覆盖。"
+                     "多文件并发下载，每个文件按 Range 分块并行拉取（服务器不支持时自动回退单连接）。"))
+    p_dl.add_argument("--blob-ids", metavar="LIST", required=True,
+                      help="逗号分隔的 blobId 列表")
+    p_dl.add_argument("--dir", metavar="PATH", required=True,
+                      help="目标目录（必须已存在，不会自动创建）")
+    p_dl.add_argument("--names", metavar="LIST",
+                      help="可选：与 --blob-ids 一一对应的文件名列表（缺省用 blobId 命名）")
+    p_dl.add_argument("--concurrency", type=int, default=16, metavar="N",
+                      help="同时下载的文件数（默认 16）")
+    p_dl.add_argument("--chunks", type=int, default=4, metavar="N",
+                      help="每个文件的 Range 分块数（默认 4，1 表示单连接）")
+    p_dl.set_defaults(func=cmd_download)
+    p_att = subparsers.add_parser(
+        "attachments",
+        help="按 ids 查邮件附件列表，支持名称过滤分组，JSON 返回",
+        description=("按 ids 列表查询邮件的附件列表（名称/类型/大小/blobId），JSON 返回。"
+                     "--filter 按 glob 语法过滤附件名（不区分大小写），! 前缀反向；"
+                     "无论是否命中都会返回，分 matched/unmatched 两组。"))
+    p_att.add_argument("--ids", metavar="LIST", required=True,
+                       help="逗号分隔的邮件 id 列表")
+    p_att.add_argument("--filter", metavar="GLOB",
+                       help="附件名 glob 过滤，如 \"*.pdf\"；\"!*.pdf\" 反向（不匹配的进 matched 组）")
+    p_att.add_argument("--download-dir", metavar="PATH",
+                       help="提供时下载所有命中的附件（matched 组）到该目录："
+                            "必须已存在（不自动创建），按原始附件名命名，重名自动重命名，多并发下载")
+    p_att.add_argument("--concurrency", type=int, default=16, metavar="N",
+                       help="下载并发文件数（默认 16）")
+    p_att.add_argument("--chunks", type=int, default=4, metavar="N",
+                       help="每文件 Range 分块数（默认 4，服务器不支持时自动回退单连接）")
+    p_att.set_defaults(func=cmd_attachments)
+
+    args = parser.parse_args()
+    if args.command is None:
+        # 未指定子命令：输出完整帮助内容
+        parser.print_help()
+        sys.exit(0)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

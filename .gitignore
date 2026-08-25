@@ -1,0 +1,6 @@
+# 身份凭据（含真实密码，禁止入库）
+jmapx_creds.json
+
+# Python 缓存
+__pycache__/
+*.pyc
