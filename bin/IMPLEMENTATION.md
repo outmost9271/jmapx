@@ -6,7 +6,9 @@
 
 - **零第三方依赖**：仅 Python 3 标准库（`urllib`/`json`/`argparse`/`concurrent.futures`/`fnmatch` 等）
 - **协议**：JMAP（RFC 8620 核心 + RFC 8621 邮件），服务端为 Stalwart v1.0.0
-- **架构**：无类、函数式模块；公共设施（凭据解析、Session、HTTP、批量拉取）与子命令（total/emails/detail/attachments/download）分离
+- **架构**：`JmapContext` 统一封装认证、Session、账户与服务端能力；公共设施（凭据、HTTP、批量拉取、下载调度、JSON 输出）与五个子命令分离
+- **错误模型**：预期错误统一抛出 `JmapxError`，由 `main` 在单一出口转换为 stderr 告警与退出码 1；下载线程中的单文件错误进入 `failed`，不会误触发线程级 `SystemExit`
+- **去重原则**：CSV 解析、ids 保序去重、附件下载按 blobId 去重均有独立公共函数，避免子命令重复实现
 
 ## 2. 凭据机制
 
@@ -95,7 +97,7 @@ GET Range: bytes=0-0
 - 目标名已存在 → `原名-N-完整blobId.ext`（N 递增）
 - 超过文件系统 `NAME_MAX`（`os.pathconf` 动态读取，默认 255 字节，UTF-8 字节计数）→ 先截断 blobId（ASCII 安全）→ 仍超限截断原名 stem → 最终兜底 `-N.ext`
 
-**原子性与清理**：临时文件 `.原名.blob8.tmp/.partN` 与目标同目录（同文件系统），`os.replace` 原子落盘；异常时 try/finally 清理全部残留；分块合并中途失败同样清理 part 文件。
+**原子性与清理**：每个下载任务使用目标目录内独立的 `TemporaryDirectory(.jmapx-*)`，避免同 blobId 并发下载时临时文件碰撞；检查重名与 `os.replace` 置于同一进程锁中，消除并发同名覆盖竞态；临时目录在成功或异常时自动清理。
 
 ## 6. 实测服务器行为（Stalwart v1.0.0，2026-08）
 
@@ -104,7 +106,7 @@ GET Range: bytes=0-0
 | `maxObjectsInGet` 超限（501 id） | HTTP 200 + 方法级 `requestTooLarge` | 按 Session 值分批 + 降批重试 |
 | `maxCallsInRequest` 超限（17 调用） | HTTP 400 `urn:ietf:params:jmap:error:limit` | 按 Session 值组合 |
 | `maxSizeRequest` 超限（11MB 请求体） | HTTP 400 + `limit: maxSizeRequest` | 客户端控制请求规模 |
-| `maxConcurrentRequests=4` | 8 并发实测未触发 429（软限制） | 设计上仍尊重该值 |
+| `maxConcurrentRequests=4` | 8 个短请求均成功（不能据此认定为软限制，可能未真正重叠） | JMAP API 拉取保持串行；附件下载走独立 download 端点 |
 | `limit: 0` 的 query | 返回全部 id（非空数组） | total 用 `limit: 1` |
 | download 端点 Range | 忽略（返回 200 全量） | 自动回退单连接 |
 | `Email/query` 无 filter | 返回账户全部邮件（含 junk/trash） | 列表语义天然含垃圾箱 |
@@ -116,3 +118,26 @@ GET Range: bytes=0-0
 - **urllib 无连接池**：每次请求新建连接；如需 HTTP/2 多路复用需迁移 `httpx[http2]`（引入第三方依赖）
 - **重定向携带 Authorization**：`.well-known/jmap` → `/jmap/session` 为同主机重定向，urllib 默认保留请求头，安全
 - **权限校验**：仅 POSIX 语义（Windows 跳过），符合目标部署环境
+
+## 8. 测试
+
+测试文件：`tests/test_jmapx.py`，仅使用标准库 `unittest`。
+
+覆盖范围：
+
+- CLI 契约：五个子命令和全部关键参数名、默认并发 16/分块 4、无子命令输出帮助
+- 凭据：环境变量优先级、配置文件 600 权限强制
+- 解析：秒级时区转换、地址精确匹配、glob 正向/反向过滤
+- JMAP：query 分页及服务端 limit 钳制、8001 ids → 17 调用/2 HTTP 请求、requestTooLarge 拆半重试、Mailbox/query 兜底
+- 下载：成功顺序、单文件失败隔离、完整 blobId 重名、NAME_MAX 超长截断
+- 真实服务器：total/emails/detail/attachments/download 全链路、实际附件大小、重复下载重命名
+
+运行：
+
+```bash
+# 离线单元测试（真实服务器测试自动跳过）
+uv run python -m unittest discover -s tests -v
+
+# 完整端到端测试（要求 bin/jmapx_creds.json 存在且权限 600）
+JMAPX_INTEGRATION=1 uv run python -m unittest discover -s tests -v
+```
